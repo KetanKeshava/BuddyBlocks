@@ -1,4 +1,4 @@
-# Focus Flow
+# Block Buddy
 
 A productivity application built with Streamlit to help you manage your focus and workflow efficiently.
 
