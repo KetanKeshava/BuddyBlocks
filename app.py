@@ -1,12 +1,15 @@
 """
-Focus Flow - A Productivity App
-Main Streamlit application file
+Focus Flow - AI-Powered Task Coach with Smart Time Blocking
+Main Streamlit application with Snowflake Cortex AI integration
 """
 
 import streamlit as st
 import time
+import uuid
+from datetime import datetime
 from utils.models import initialize_session_state
-from utils.ai_parser import parse_journal_mock
+from utils.snowflake_client import get_snowflake_client
+from utils.ui_components import show_connection_status, show_ai_badge
 
 
 def display_task_card(task):
@@ -160,9 +163,16 @@ def filter_tasks(tasks, filter_by):
 def display_focus_session():
     """Display the focus session timer interface"""
     
+    # Get client for coach messages
+    client = get_snowflake_client()
+    
     # Check if current task exists
     if st.session_state.current_task is None:
         st.info("👈 Select a task from the Tasks tab to start a focus session")
+        
+        # Show motivational message
+        start_message = client.get_coach_message('session_start', {'task': 'a task', 'duration': 60})
+        st.info(f"🎙️ Coach: {start_message}")
         return
     
     task = st.session_state.current_task
@@ -206,6 +216,15 @@ def display_focus_session():
     st.progress(progress)
     st.caption(f"Progress: {progress * 100:.1f}%")
     
+    # Show coach message at halfway point
+    if 0.45 <= progress <= 0.55 and 'halfway_message_shown' not in st.session_state:
+        halfway_message = client.get_coach_message(
+            'halfway',
+            {'task': task.title, 'duration': task.estimated_duration}
+        )
+        st.info(f"🎙️ Coach: {halfway_message}")
+        st.session_state.halfway_message_shown = True
+    
     st.divider()
     
     # Control buttons
@@ -237,14 +256,38 @@ def display_focus_session():
             st.session_state.completed_sessions += 1
             st.session_state.total_focus_time += actual_time
             
+            # Get completion message from coach
+            completion_message = client.get_coach_message(
+                'completion',
+                {'task': task.title, 'duration': actual_time}
+            )
+            
+            # Try to save task to database (if Snowflake connected)
+            try:
+                task_data = {
+                    'task_id': task.id,
+                    'title': task.title,
+                    'description': task.description,
+                    'estimated_duration': task.estimated_duration,
+                    'subtasks': task.subtasks,
+                    'status': 'completed',
+                    'priority_score': task.priority_score
+                }
+                save_result = client.save_task(task_data)
+                st.success(save_result)
+            except Exception as e:
+                # Database save failed - that's OK in demo mode
+                pass
+            
             # Reset timer state
             st.session_state.current_task = None
             st.session_state.timer_running = False
             st.session_state.time_remaining = 0
             st.session_state.session_start = None
+            st.session_state.pop('halfway_message_shown', None)
             
-            # Show success message
-            st.success(f"✅ Task completed! Great work on: {task.title}")
+            # Show success message with coach feedback
+            st.success(f"✅ {completion_message}")
             st.balloons()
             
             time.sleep(2)
@@ -273,16 +316,32 @@ def main():
     # Initialize session state
     initialize_session_state()
     
+    # Initialize Snowflake client (with automatic fallback to mock AI)
+    client = get_snowflake_client()
+    
     # Initialize active tab if not exists
     if 'active_tab' not in st.session_state:
         st.session_state.active_tab = "journal"
     
-    # App header
-    st.title("🎯 Focus Flow")
-    st.subheader("AI-Powered Task Coach with Smart Time Blocking")
+    # App header with AI badge
+    col1, col2 = st.columns([4, 1])
+    with col1:
+        st.title("🎯 Focus Flow")
+        st.subheader("AI-Powered Task Coach with Smart Time Blocking")
+    with col2:
+        show_ai_badge(client)
     
     # Sidebar
     with st.sidebar:
+        # Connection status
+        st.header("🔌 Connection")
+        show_connection_status(client)
+        
+        # Cache clear button (for debugging)
+        if st.button("🔄 Refresh Connection", help="Clear cache and reconnect"):
+            st.cache_resource.clear()
+            st.rerun()
+        
         st.header("⚙️ Settings")
         
         # Work duration slider
@@ -343,14 +402,14 @@ def main():
     
     # Main content area with tabs
     # Determine selected tab based on session state
-    tab_names = ["📝 Journal", "✅ Tasks", "⏱️ Focus Session"]
+    tab_names = ["📝 Journal", "✅ Tasks", "⏱️ Focus Session", "📊 Analytics"]
     if st.session_state.active_tab == "focus":
         default_index = 2
         st.session_state.active_tab = "journal"  # Reset for next time
     else:
         default_index = 0
     
-    tab1, tab2, tab3 = st.tabs(tab_names)
+    tab1, tab2, tab3, tab4 = st.tabs(tab_names)
     
     with tab1:
         st.write("### What's on your mind?")
@@ -376,25 +435,50 @@ def main():
         if st.button("✨ Break it Down", type="primary", use_container_width=True):
             if journal_input.strip():
                 # Show spinner while processing
-                with st.spinner("AI is analyzing your tasks..."):
-                    # Parse journal text into tasks
-                    parsed_tasks = parse_journal_mock(journal_input)
-                    
-                    # Simulated processing time
-                    time.sleep(2)
-                    
-                    # Add tasks to session state
-                    st.session_state.tasks.extend(parsed_tasks)
-                
-                # Show success message
-                st.success(f"✅ {len(parsed_tasks)} tasks created!")
-                
-                # Display balloons animation
-                st.balloons()
-                
-                # Clear journal input
-                st.session_state.journal_input = ""
-                st.rerun()
+                with st.spinner(f"🤖 {client.get_ai_source()} is analyzing your tasks..."):
+                    try:
+                        # Parse journal using Snowflake client (with automatic fallback)
+                        parsed_tasks_data = client.parse_journal(journal_input)
+                        
+                        # Convert to Task objects
+                        from utils.models import Task
+                        parsed_tasks = []
+                        for task_data in parsed_tasks_data:
+                            task = Task(
+                                id=task_data.get('task_id', str(uuid.uuid4())),
+                                title=task_data.get('title', 'Untitled Task'),
+                                description=task_data.get('description', ''),
+                                estimated_duration=task_data.get('estimated_duration', 60),
+                                subtasks=task_data.get('subtasks', []),
+                                status=task_data.get('status', 'pending'),
+                                priority_score=task_data.get('priority_score', 50.0),
+                                created_at=datetime.now()
+                            )
+                            parsed_tasks.append(task)
+                        
+                        # Add tasks to session state
+                        st.session_state.tasks.extend(parsed_tasks)
+                        
+                        # Show success message
+                        st.success(f"✅ {len(parsed_tasks)} tasks created using {client.get_ai_source()}!")
+                        
+                        # Get a motivational coach message
+                        coach_message = client.get_coach_message(
+                            'session_start',
+                            {'task': 'your new tasks', 'duration': sum(t.estimated_duration for t in parsed_tasks)}
+                        )
+                        st.info(f"🎙️ Coach: {coach_message}")
+                        
+                        # Display balloons animation
+                        st.balloons()
+                        
+                        # Clear journal input
+                        st.session_state.journal_input = ""
+                        st.rerun()
+                        
+                    except Exception as e:
+                        st.error(f"❌ Error parsing journal: {str(e)}")
+                        st.info("💡 The app is still functional. Try again or check your connection.")
             else:
                 st.warning("Please write something in your journal entry first.")
         
@@ -460,14 +544,147 @@ def main():
         st.write("### Focus Session")
         display_focus_session()
     
+    with tab4:
+        st.write("### 📊 Analytics & Insights")
+        
+        # Check if connected to Snowflake for analytics
+        if client and client.is_connected:
+            st.info(f"📡 Connected to {client.get_ai_source()} - Real-time analytics available!")
+            
+            try:
+                # Get session statistics from Snowflake
+                stats = client.get_session_statistics()
+                
+                st.subheader("Today's Performance")
+                
+                col1, col2, col3, col4 = st.columns(4)
+                
+                with col1:
+                    st.metric(
+                        "Total Sessions",
+                        stats.get('total_sessions', 0),
+                        help="Number of focus sessions completed today"
+                    )
+                
+                with col2:
+                    total_min = stats.get('total_minutes', 0)
+                    hours = total_min // 60
+                    minutes = total_min % 60
+                    st.metric(
+                        "Total Time",
+                        f"{hours}h {minutes}m" if hours > 0 else f"{minutes}m",
+                        help="Total focus time today"
+                    )
+                
+                with col3:
+                    st.metric(
+                        "Completion Rate",
+                        f"{stats.get('completion_rate', 0)}%",
+                        help="Percentage of sessions completed"
+                    )
+                
+                with col4:
+                    st.metric(
+                        "Unique Tasks",
+                        stats.get('unique_tasks', 0),
+                        help="Number of different tasks worked on"
+                    )
+                
+                st.divider()
+                
+                # Get all tasks from database
+                try:
+                    all_tasks = client.get_all_tasks()
+                    
+                    if all_tasks:
+                        st.subheader("📋 Task History")
+                        st.caption(f"Showing {len(all_tasks)} tasks from database")
+                        
+                        # Display recent tasks
+                        for task in all_tasks[:10]:  # Show last 10 tasks
+                            with st.expander(f"{'✅' if task['status'] == 'completed' else '⏳'} {task['title']}"):
+                                st.write(f"**Description:** {task['description']}")
+                                st.write(f"**Duration:** {task['estimated_duration']} minutes")
+                                st.write(f"**Status:** {task['status']}")
+                                st.write(f"**Priority:** {task['priority_score']}")
+                                st.caption(f"Created: {task['created_at']}")
+                    else:
+                        st.info("No task history yet. Complete some tasks to see analytics!")
+                
+                except Exception as e:
+                    st.warning(f"⚠️ Could not load task history: {str(e)}")
+            
+            except Exception as e:
+                st.error(f"❌ Error loading analytics: {str(e)}")
+        
+        else:
+            # Demo mode analytics
+            st.warning("⚠️ Running in Demo Mode - Analytics limited to session data")
+            
+            st.subheader("Session Statistics")
+            
+            col1, col2, col3 = st.columns(3)
+            
+            with col1:
+                st.metric("Tasks Created", len(st.session_state.tasks))
+            
+            with col2:
+                completed = len([t for t in st.session_state.tasks if t.status == 'completed'])
+                st.metric("Tasks Completed", completed)
+            
+            with col3:
+                hours = st.session_state.total_focus_time // 60
+                minutes = st.session_state.total_focus_time % 60
+                st.metric("Focus Time", f"{hours}h {minutes}m" if hours > 0 else f"{minutes}m")
+            
+            st.info("""
+            **💡 Connect to Snowflake for:**
+            - Persistent task storage
+            - Historical analytics
+            - Advanced insights
+            - Cross-device sync
+            
+            Check the sidebar for connection options.
+            """)
+            
+            # Show task breakdown
+            if st.session_state.tasks:
+                st.divider()
+                st.subheader("Task Status Breakdown")
+                
+                status_counts = {
+                    'pending': len([t for t in st.session_state.tasks if t.status == 'pending']),
+                    'in_progress': len([t for t in st.session_state.tasks if t.status == 'in_progress']),
+                    'completed': len([t for t in st.session_state.tasks if t.status == 'completed'])
+                }
+                
+                col1, col2, col3 = st.columns(3)
+                with col1:
+                    st.metric("⏳ Pending", status_counts['pending'])
+                with col2:
+                    st.metric("▶️ In Progress", status_counts['in_progress'])
+                with col3:
+                    st.metric("✅ Completed", status_counts['completed'])
+    
     # Footer
     st.divider()
-    st.markdown(
-        "<div style='text-align: center; color: #666; padding: 20px;'>"
-        "Built with Streamlit + Snowflake Cortex"
-        "</div>",
-        unsafe_allow_html=True
-    )
+    
+    # Show current AI source
+    footer_col1, footer_col2 = st.columns([3, 1])
+    with footer_col1:
+        st.markdown(
+            "<div style='text-align: center; color: #666; padding: 20px;'>"
+            "Built with Streamlit + Snowflake Cortex AI"
+            "</div>",
+            unsafe_allow_html=True
+        )
+    with footer_col2:
+        if client and client.is_connected:
+            st.success("🟢 Live")
+            st.caption("Connected to Snowflake")
+        else:
+            st.warning("🟡 Demo")
+            st.caption("Using Mock AI")
 
 if __name__ == "__main__":
     main()
